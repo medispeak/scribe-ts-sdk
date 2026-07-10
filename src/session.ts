@@ -1,5 +1,10 @@
 import { ScribeError, errorFromResponse } from "./errors";
-import { SessionHttp, sleep } from "./http";
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  RequestTimeoutError,
+  SessionHttp,
+  sleep,
+} from "./http";
 import {
   isTerminalStatus,
   mapSessionBody,
@@ -44,7 +49,9 @@ export class Session implements ScribeSession {
   private controller: RecorderController | undefined;
 
   // Upload bookkeeping. Chunks are buffered so a resume can re-send only the
-  // seqs the server has not acknowledged.
+  // seqs the server has not acknowledged. Once a chunk is durably uploaded
+  // (acked by a successful POST or confirmed via audio/status) its Blob is
+  // dropped from `buffer`, so only the unacknowledged tail is held in memory.
   private readonly buffer = new Map<number, Blob>();
   private readonly uploaded = new Set<number>();
   private queue: number[] = [];
@@ -54,6 +61,8 @@ export class Session implements ScribeSession {
 
   private stopping = false;
   private canceled = false;
+  // Memoizes the in-flight stop() so concurrent calls share one commit.
+  private stopPromise: Promise<void> | null = null;
 
   constructor(id: string, http: SessionHttp) {
     this.id = id;
@@ -131,11 +140,26 @@ export class Session implements ScribeSession {
   }
 
   async stop(): Promise<void> {
+    // Re-entrancy guard: a second concurrent stop() awaits the first instead of
+    // issuing a duplicate commit. Set synchronously (before any await) so two
+    // overlapping calls can never both pass the guards below.
+    if (this.stopPromise) return this.stopPromise;
     if (this._status === "processing") return; // already committed
     if (this._status !== "recording" && this._status !== "paused") {
       throw new ScribeError("cannot stop: session is not recording");
     }
 
+    this.stopPromise = this.runStop();
+    try {
+      await this.stopPromise;
+    } finally {
+      // Clear on completion: on success `status` is now `processing` (a later
+      // stop() is a no-op); on failure the caller may retry.
+      this.stopPromise = null;
+    }
+  }
+
+  private async runStop(): Promise<void> {
     this.stopping = true;
 
     if (this.controller) {
@@ -208,7 +232,7 @@ export class Session implements ScribeSession {
       // A fresh session may 404/blank here; treat as "nothing received yet".
     }
 
-    for (const seq of received) this.uploaded.add(seq);
+    for (const seq of received) this.markUploaded(seq);
 
     // Continue numbering after the highest known seq (server-side).
     const maxReceived = received.length > 0 ? Math.max(...received) : -1;
@@ -249,12 +273,22 @@ export class Session implements ScribeSession {
       if (blob === undefined) continue;
       try {
         await this.uploadChunk(seq, blob, this.finalSeq === seq);
-        this.uploaded.add(seq);
+        this.markUploaded(seq);
       } catch (err) {
         this.queue.unshift(seq); // leave it pending for a later retry
         throw err;
       }
     }
+  }
+
+  /**
+   * Record a seq as durably uploaded and release its buffered Blob. Only the
+   * unacknowledged tail is retained, bounding memory for long recordings while
+   * keeping resume correct (reconcile re-queues only what's still buffered).
+   */
+  private markUploaded(seq: number): void {
+    this.uploaded.add(seq);
+    this.buffer.delete(seq);
   }
 
   private async uploadChunk(
@@ -283,11 +317,35 @@ export class Session implements ScribeSession {
     const timeout = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const deadline = Date.now() + timeout;
 
+    const timedOut = (): ScribeError =>
+      new ScribeError(`result polling timed out after ${timeout}ms`, {
+        status: undefined,
+      });
+
     for (;;) {
-      const body = await this.http.getJson<WireSessionBody>(
-        `scribe_sessions/${this.id}`,
-        "poll result",
-      );
+      let body: WireSessionBody;
+      try {
+        // Bound each poll by the smaller of the default request timeout and the
+        // caller's remaining deadline, so a stalled connection can't hang here.
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw timedOut();
+        body = await this.http.getJson<WireSessionBody>(
+          `scribe_sessions/${this.id}`,
+          "poll result",
+          { timeoutMs: Math.min(DEFAULT_REQUEST_TIMEOUT_MS, remaining) },
+        );
+      } catch (err) {
+        // A per-request timeout must not crash the loop: keep polling until the
+        // overall deadline, then reject with a clear timeout. Genuine errors
+        // (HTTP non-ok, network) propagate immediately, as before.
+        if (err instanceof RequestTimeoutError) {
+          if (Date.now() >= deadline) throw timedOut();
+          await sleep(interval);
+          continue;
+        }
+        throw err;
+      }
+
       const mapped = mapSessionBody(body);
 
       if (mapped.transcript !== undefined) this.emitPartial(mapped.transcript);
@@ -297,12 +355,7 @@ export class Session implements ScribeSession {
         return mapped;
       }
 
-      if (Date.now() >= deadline) {
-        throw new ScribeError(
-          `result polling timed out after ${timeout}ms`,
-          { status: undefined },
-        );
-      }
+      if (Date.now() >= deadline) throw timedOut();
       await sleep(interval);
     }
   }

@@ -49,7 +49,11 @@ export type OutputSpec =
 export interface StartSessionOptions {
   /** The outputs to produce. */
   outputs: OutputSpec[];
-  /** Preferred language hints, e.g. `["auto"]` or `["en", "hi"]`. */
+  /**
+   * Preferred language hints, e.g. `["auto"]` or `["en", "hi"]`. Note: the
+   * backend stores a single language, so only the primary (first) hint is sent;
+   * additional entries are accepted for forward compatibility but ignored today.
+   */
   language?: string[];
   /** Recording mode. */
   mode?: "consultation" | "dictation";

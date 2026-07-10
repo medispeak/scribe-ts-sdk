@@ -50,7 +50,8 @@ describe("server.createSession", () => {
     expect(call!.headers["Content-Type"]).toBe("application/json");
 
     const sent = JSON.parse(call!.body as string);
-    expect(sent.language_hint).toEqual(["auto"]);
+    // language_hint is a scalar (backend stores one language): the primary hint.
+    expect(sent.language_hint).toBe("auto");
     expect(sent.mode).toBe("consultation");
     expect(sent.callback_url).toBe("https://app.example.test/webhooks/scribe");
 
@@ -68,6 +69,19 @@ describe("server.createSession", () => {
       { type: "transcript" },
       { type: "note", template_ref: "tmpl_42" },
     ]);
+  });
+
+  it("sends only the primary language hint as a scalar when several are given", async () => {
+    const mock = createFetchMock(() => resp({ id: "s3", status: "created" }, 201));
+    const client = createServerClient({ baseUrl: BASE, apiKey: API_KEY, fetch: mock.fn });
+
+    await client.createSession({
+      outputs: [{ type: "transcript" }],
+      language: ["en", "hi"],
+    });
+
+    const sent = JSON.parse(mock.calls[0]!.body as string);
+    expect(sent.language_hint).toBe("en");
   });
 
   it("omits undefined optional fields (no language/mode/callback)", async () => {

@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { createScribeClient } from "../src/index";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createScribeClient, ScribeError } from "../src/index";
 import {
   audioBlob,
   createFetchMock,
@@ -16,6 +16,10 @@ const TOKEN = "mss_session_token";
 function statusOk() {
   return resp({ received_seqs: [], final_seen: false, bytes: 0 }, 200);
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("browser: chunk upload", () => {
   it("POSTs multipart form-data with seq + chunk blob and Bearer session token", async () => {
@@ -267,5 +271,98 @@ describe("browser: auth refresh", () => {
     expect(gets).toHaveLength(2);
     expect(gets[0]!.bearer).toBe("tok1");
     expect(gets[1]!.bearer).toBe("tok2");
+  });
+});
+
+describe("browser: result polling timeout", () => {
+  it("rejects with a timeout when a poll never responds (does not hang)", async () => {
+    vi.useFakeTimers();
+    // A fetch that connects but never settles — the classic hang.
+    const mock = createFetchMock(() => new Promise<Response>(() => {}));
+    const client = createScribeClient({ baseUrl: BASE, getToken: () => TOKEN, fetch: mock.fn });
+    const session = client.session("sess_stall");
+
+    const p = session.result({ pollIntervalMs: 10, timeoutMs: 1000 });
+    // Capture the outcome so advancing the clock never trips an unhandled
+    // rejection while the promise is still pending.
+    const settled = p.then(
+      () => ({ ok: true as const }),
+      (err: unknown) => ({ ok: false as const, err }),
+    );
+
+    // Advance past the overall deadline: the per-request timeout aborts the
+    // stalled fetch and result() rejects with a timeout instead of hanging.
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const outcome = await settled;
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.err).toBeInstanceOf(ScribeError);
+      expect(String(outcome.err)).toMatch(/timed out/);
+    }
+  });
+});
+
+describe("browser: concurrent stop", () => {
+  it("guards re-entrancy: two overlapping stop() calls issue exactly one commit", async () => {
+    const mock = createFetchMock((call) => {
+      if (call.url.endsWith("/audio/status")) return statusOk();
+      if (call.url.endsWith("/audio/chunks")) return resp({ received: 0 }, 200);
+      if (call.url.endsWith("/commit")) return resp({}, 202);
+      return resp({ error: "unexpected" }, 500);
+    });
+
+    const recorder = installMockRecorder();
+    recorder.setFinalChunk(audioBlob("tail"));
+    const client = createScribeClient({ baseUrl: BASE, getToken: () => TOKEN, fetch: mock.fn });
+    const session = client.session("sess_concurrent");
+
+    const statuses: string[] = [];
+    session.onStatusChange((s) => statuses.push(s));
+
+    await session.record();
+    recorder.emit(audioBlob("x"));
+
+    // Fire two stop() calls before the first settles.
+    await Promise.all([session.stop(), session.stop()]);
+
+    expect(mock.matching("/commit", "POST").length).toBe(1);
+    expect(statuses).toContain("processing");
+  });
+});
+
+describe("browser: chunk buffer pruning", () => {
+  it("releases the in-memory blob once a chunk is durably uploaded, keeping the unacknowledged tail", async () => {
+    const posts: { seq: number; status: number }[] = [];
+    const failSeqs = new Set<number>([1]);
+    const mock = createFetchMock((call) => {
+      if (call.url.endsWith("/audio/status")) return statusOk();
+      if (call.url.endsWith("/audio/chunks")) {
+        const seq = Number(formField(call.body, "seq"));
+        const fail = failSeqs.has(seq);
+        posts.push({ seq, status: fail ? 500 : 200 });
+        return resp(fail ? { error: "net" } : { received: seq }, fail ? 500 : 200);
+      }
+      return resp({ error: "unexpected" }, 500);
+    });
+
+    const recorder = installMockRecorder();
+    const client = createScribeClient({ baseUrl: BASE, getToken: () => TOKEN, fetch: mock.fn });
+    const session = client.session("sess_prune");
+    // Read the private buffer to assert the retained (unacknowledged) tail.
+    const buffer = (session as unknown as { buffer: Map<number, Blob> }).buffer;
+
+    await session.record();
+
+    recorder.emit(audioBlob("0"));
+    await vi.waitFor(() => expect(posts.some((p) => p.seq === 0 && p.status === 200)).toBe(true));
+    // Durably uploaded → its Blob is dropped from the in-memory buffer.
+    expect(buffer.has(0)).toBe(false);
+
+    recorder.emit(audioBlob("1"));
+    await vi.waitFor(() => expect(posts.some((p) => p.seq === 1 && p.status === 500)).toBe(true));
+    // Unacknowledged → retained so a resume can re-send it.
+    expect(buffer.has(1)).toBe(true);
+    expect(buffer.size).toBe(1);
   });
 });

@@ -67,7 +67,9 @@ export function createServerClient(
     async createSession(opts: StartSessionOptions): Promise<CreatedSession> {
       const body = pruneUndefined({
         outputs: opts.outputs.map(mapOutputSpec),
-        language_hint: opts.language,
+        // The backend stores a single language, so `language_hint` must be a
+        // scalar. Send the primary (first) hint; omit the key when none given.
+        language_hint: opts.language?.[0],
         mode: opts.mode,
         callback_url: opts.callbackUrl,
       });
