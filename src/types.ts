@@ -87,6 +87,7 @@ export type ScribeStatus =
   | "recording"
   | "paused"
   | "processing"
+  | "interrupted" // upload/commit could not reach/complete the server
   | "completed"
   | "failed";
 
@@ -105,11 +106,28 @@ export interface ScribeClientConfig {
   getToken: (sessionId: string) => string | Promise<string>;
   /** Optional `fetch` implementation (defaults to the global `fetch`). */
   fetch?: typeof fetch;
+  /** Keep the local recording in the store after a successful commit (default false). */
+  retainLocalRecording?: boolean;
 }
 
 export interface RecordOptions {
   /** MediaRecorder timeslice in ms (default 5000). */
   chunkMs?: number;
+  /** Standalone transcription-segment duration in ms (default 6000). */
+  segmentMs?: number;
+  /**
+   * Live-transcript poll interval in ms (default 1500). Injectable so tests
+   * can pass a tiny value (mirrors `result()`'s `pollIntervalMs`).
+   */
+  livePollIntervalMs?: number;
+  /**
+   * Capture standalone segments + poll a live transcript during recording.
+   * Defaults to `false` until backend plan 022 is confirmed live (lockstep with
+   * the backend segments flag); set `true` to opt in to live capture once the
+   * endpoint ships. When `false`, behavior is storage-only capture (post-commit
+   * transcript only).
+   */
+  liveTranscription?: boolean;
 }
 
 export interface ResultOptions {
@@ -133,6 +151,13 @@ export interface ScribeSession {
   cancel(): Promise<void>;
   /** Poll until a terminal status and return the mapped result. */
   result(opts?: ResultOptions): Promise<ScribeResult>;
+  /**
+   * The local recording as one continuous Blob (all stored chunks concatenated
+   * in seq order) plus an object URL, or undefined if nothing is stored.
+   */
+  localRecording(): Promise<{ url: string; blob: Blob } | undefined>;
+  /** Re-send any pending chunks and commit. Use after an `interrupted` status. */
+  retry(): Promise<void>;
   /** Subscribe to partial transcript updates. Returns an unsubscribe function. */
   onPartialTranscript(cb: (text: string) => void): () => void;
   /** Subscribe to status changes. Returns an unsubscribe function. */
@@ -142,6 +167,12 @@ export interface ScribeSession {
 export interface ScribeClient {
   /** Bind to an existing session id (created + token-minted by your backend). */
   session(sessionId: string): ScribeSession;
+  /**
+   * Rebuild a session from locally persisted chunks (e.g. after a reload) and
+   * re-hydrate its pending seqs. The caller then invokes `retry()` to reconcile
+   * and commit — a resumed session is `idle`, so `stop()` would throw.
+   */
+  resume(sessionId: string): Promise<ScribeSession>;
 }
 
 /* --------------------------------------------------------------------------

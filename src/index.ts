@@ -4,7 +4,7 @@
  * Create a client with your v2 base URL and a `getToken` provider, then drive a
  * session: record → stop → result. The client never holds an account secret.
  */
-export { createScribeClient } from "./client";
+export { createScribeClient, listUnfinishedSessions } from "./client";
 export { ScribeError } from "./errors";
 
 export type {

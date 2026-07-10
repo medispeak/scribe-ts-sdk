@@ -1,5 +1,10 @@
 import { vi } from "vitest";
 import { setRecorderFactory, type RecorderFactory } from "../src/media";
+import { MemoryChunkStore, setChunkStore } from "../src/persistence";
+import {
+  setSegmentRecorderFactory,
+  type SegmentRecorderFactory,
+} from "../src/segments";
 
 /** A minimal Response-like object exposing just what the SDK reads. */
 export function resp(body: unknown, status = 200): Response {
@@ -128,7 +133,58 @@ export function installMockRecorder(): MockRecorderHandle {
   };
 }
 
+export interface MockSegmentRecorderHandle {
+  /** Drive one completed, standalone segment file (as the recorder would). */
+  emit(blob: Blob): void;
+  stopped(): boolean;
+  segmentMs(): number | undefined;
+}
+
+/**
+ * Install a fake segment recorder factory and return a handle to drive it.
+ * Mirrors {@link installMockRecorder}; the two captures run independently so a
+ * test can drive both the storage recorder and the segment recorder at once.
+ */
+export function installMockSegmentRecorder(): MockSegmentRecorderHandle {
+  const state: {
+    onSegment?: (blob: Blob) => void;
+    segmentMs?: number;
+    stopped: boolean;
+  } = { stopped: false };
+
+  const factory: SegmentRecorderFactory = async ({ segmentMs, onSegment }) => {
+    state.onSegment = onSegment;
+    state.segmentMs = segmentMs;
+    return {
+      async stop() {
+        state.stopped = true;
+      },
+    };
+  };
+
+  setSegmentRecorderFactory(factory);
+
+  return {
+    emit(blob) {
+      state.onSegment?.(blob);
+    },
+    stopped: () => state.stopped,
+    segmentMs: () => state.segmentMs,
+  };
+}
+
 /** A tiny audio blob for tests. */
 export function audioBlob(label = "audio"): Blob {
   return new Blob([label], { type: "audio/webm" });
+}
+
+/**
+ * Install an in-memory chunk store (mirrors installMockRecorder) and return it
+ * as the handle: MemoryChunkStore already exposes getAll/getPending/
+ * listUnfinished/clear for assertions. Tests call resetChunkStore() in afterEach.
+ */
+export function installMemoryChunkStore(): MemoryChunkStore {
+  const store = new MemoryChunkStore();
+  setChunkStore(store);
+  return store;
 }

@@ -1,4 +1,5 @@
 import { SessionHttp } from "./http";
+import { getChunkStore } from "./persistence";
 import { Session } from "./session";
 import type { ScribeClient, ScribeClientConfig, ScribeSession } from "./types";
 
@@ -24,16 +25,34 @@ export function createScribeClient(config: ScribeClientConfig): ScribeClient {
   }
   const fetchImpl = resolveFetch(config);
 
+  const build = (sessionId: string): Session => {
+    if (!sessionId) throw new TypeError("session: `sessionId` is required");
+    const http = new SessionHttp(
+      config.baseUrl,
+      sessionId,
+      config.getToken,
+      fetchImpl,
+    );
+    return new Session(sessionId, http, {
+      retainLocalRecording: config.retainLocalRecording,
+    });
+  };
+
   return {
     session(sessionId: string): ScribeSession {
-      if (!sessionId) throw new TypeError("session: `sessionId` is required");
-      const http = new SessionHttp(
-        config.baseUrl,
-        sessionId,
-        config.getToken,
-        fetchImpl,
-      );
-      return new Session(sessionId, http);
+      return build(sessionId);
+    },
+    async resume(sessionId: string): Promise<ScribeSession> {
+      // Rebuild over the same (injected/default) store and re-hydrate its
+      // pending seqs; the caller then invokes retry() to reconcile + commit.
+      const session = build(sessionId);
+      await session.hydrate();
+      return session;
     },
   };
+}
+
+/** Session ids that have un-committed audio persisted locally (e.g. after a reload). */
+export async function listUnfinishedSessions(): Promise<string[]> {
+  return getChunkStore().listUnfinished();
 }
