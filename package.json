@@ -4,6 +4,18 @@
   "description": "Medispeak-native browser scribe SDK: record a consultation and auto-fill a form, without ever holding an account secret in the browser.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/medispeak/scribe-ts-sdk.git"
+  },
+  "homepage": "https://github.com/medispeak/scribe-ts-sdk#readme",
+  "bugs": "https://github.com/medispeak/scribe-ts-sdk/issues",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "sideEffects": false,
   "files": [
     "dist"
@@ -45,6 +57,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
