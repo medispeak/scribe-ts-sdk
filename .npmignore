@@ -1,0 +1,10 @@
+# Only dist is published (see package.json "files"). This file is a belt-and-suspenders
+# guard so source/tests/config never ship even if "files" is edited.
+src
+test
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+.gitignore
+coverage
+*.log
