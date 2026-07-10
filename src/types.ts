@@ -113,6 +113,21 @@ export interface ScribeClientConfig {
 export interface RecordOptions {
   /** MediaRecorder timeslice in ms (default 5000). */
   chunkMs?: number;
+  /** Standalone transcription-segment duration in ms (default 6000). */
+  segmentMs?: number;
+  /**
+   * Live-transcript poll interval in ms (default 1500). Injectable so tests
+   * can pass a tiny value (mirrors `result()`'s `pollIntervalMs`).
+   */
+  livePollIntervalMs?: number;
+  /**
+   * Capture standalone segments + poll a live transcript during recording.
+   * Defaults to `false` until backend plan 022 is confirmed live (lockstep with
+   * the backend segments flag); set `true` to opt in to live capture once the
+   * endpoint ships. When `false`, behavior is storage-only capture (post-commit
+   * transcript only).
+   */
+  liveTranscription?: boolean;
 }
 
 export interface ResultOptions {

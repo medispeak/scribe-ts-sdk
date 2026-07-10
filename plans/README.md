@@ -15,7 +15,7 @@ repo at `medispeak/backend/plans/README.md`.
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Durable, forgiving capture — IndexedDB source of truth, resilient sync, playback + retry, resume after reload | P1 | L | — | DONE |
-| 002 | Live transcription segments (second standalone capture) + during-recording transcript poll | P2 | L | 001, backend 022 | TODO |
+| 002 | Live transcription segments (second standalone capture) + during-recording transcript poll | P2 | L | 001, backend 022 | DONE |
 
 Status values: TODO · IN PROGRESS · DONE · BLOCKED (one-line reason) · REJECTED (one-line rationale)
 

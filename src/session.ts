@@ -12,6 +12,10 @@ import {
 } from "./mapping";
 import { getRecorderFactory, type RecorderController } from "./media";
 import { getChunkStore, type ChunkStore } from "./persistence";
+import {
+  getSegmentRecorderFactory,
+  type SegmentController,
+} from "./segments";
 import type {
   RecordOptions,
   ResultOptions,
@@ -21,7 +25,9 @@ import type {
 } from "./types";
 
 const DEFAULT_CHUNK_MS = 5000;
+const DEFAULT_SEGMENT_MS = 6000;
 const DEFAULT_POLL_INTERVAL_MS = 2000;
+const DEFAULT_LIVE_POLL_INTERVAL_MS = 1500;
 const DEFAULT_TIMEOUT_MS = 120000;
 const DEFAULT_UPLOAD_ATTEMPTS = 3;
 const DEFAULT_BACKOFF_BASE_MS = 200;
@@ -64,6 +70,17 @@ export class Session implements ScribeSession {
   private lastPartial: string | undefined;
 
   private controller: RecorderController | undefined;
+
+  // Live transcription (best-effort, additive). A second standalone capture
+  // emits independently-decodable segment files uploaded to the segments
+  // endpoint, and a poll surfaces the growing transcript while still recording.
+  // This stream is strictly isolated from the durable storage path above: a
+  // segment failure is swallowed and never touches nextSeq/buffer/queue/finalSeq
+  // or the commit. Gated by RecordOptions.liveTranscription (default off).
+  private segmentController: SegmentController | undefined;
+  private nextSegmentSeq = 0;
+  private livePollTimer: ReturnType<typeof setTimeout> | undefined;
+  private livePolling = false;
 
   // Upload bookkeeping. Chunks are buffered so a resume can re-send only the
   // seqs the server has not acknowledged. Once a chunk is durably uploaded
@@ -161,6 +178,28 @@ export class Session implements ScribeSession {
       chunkMs,
       onChunk: (blob) => this.enqueue(blob),
     });
+
+    // Live transcription is opt-in and strictly additive: it starts AFTER the
+    // durable storage recorder is running and can never block it. Off by default
+    // until backend plan 022 is live.
+    const live = opts?.liveTranscription ?? false;
+    if (live) {
+      const segmentMs = opts?.segmentMs ?? DEFAULT_SEGMENT_MS;
+      this.nextSegmentSeq = 0;
+      try {
+        this.segmentController = await getSegmentRecorderFactory()({
+          segmentMs,
+          onSegment: (b) => this.enqueueSegment(b),
+        });
+      } catch {
+        // Best-effort: a segment-capture failure must never block the durable
+        // storage recorder. Continue with storage-only capture.
+        this.segmentController = undefined;
+      }
+      this.startLivePoll(
+        opts?.livePollIntervalMs ?? DEFAULT_LIVE_POLL_INTERVAL_MS,
+      );
+    }
   }
 
   pause(): void {
@@ -205,6 +244,19 @@ export class Session implements ScribeSession {
       this.controller = undefined;
     }
 
+    // Tear down the best-effort live-transcription stream. This is isolated
+    // from the durable commit below: stopping the poll or a thrown segment
+    // stop() must never prevent reconcile/commit.
+    this.stopLivePoll();
+    if (this.segmentController) {
+      try {
+        await this.segmentController.stop();
+      } catch {
+        // best-effort segment flush; must not block commit
+      }
+      this.segmentController = undefined;
+    }
+
     // Fallback: if the recorder emitted no trailing chunk, mark the highest
     // produced seq as final so audio/status can report completeness.
     if (this.finalSeq === undefined && this.nextSeq > 0) {
@@ -235,6 +287,16 @@ export class Session implements ScribeSession {
     this.canceled = true;
     this.stopping = false;
     this.queue = [];
+    // Best-effort teardown of the live-transcription stream (additive, isolated).
+    this.stopLivePoll();
+    if (this.segmentController) {
+      try {
+        await this.segmentController.stop();
+      } catch {
+        // best-effort segment stop
+      }
+      this.segmentController = undefined;
+    }
     if (this.controller) {
       try {
         await this.controller.stop();
@@ -482,6 +544,76 @@ export class Session implements ScribeSession {
       }
     }
     throw lastErr;
+  }
+
+  /* ----------------------------------------------------------------------
+   * Live transcription (best-effort segments + during-recording poll)
+   *
+   * Strictly additive and isolated from the durable storage path: nothing here
+   * mutates nextSeq/buffer/queue/finalSeq or can reject into stop()/commit. A
+   * lost segment only costs a little live transcript.
+   * -------------------------------------------------------------------- */
+
+  /**
+   * Assign a segment seq synchronously (preserving order) and fire-and-forget
+   * its upload. A failed upload drops only that one segment and never rejects
+   * into the storage path.
+   */
+  private enqueueSegment(blob: Blob): void {
+    if (this.canceled) return;
+    const seq = this.nextSegmentSeq++;
+    // Best-effort: a lost segment only costs a little live transcript.
+    void this.uploadSegment(seq, blob).catch(() => undefined);
+  }
+
+  /**
+   * POST one standalone segment file to the segments endpoint. Mirrors
+   * {@link uploadChunk}'s multipart shape but posts `seq` + `segment`. Does NOT
+   * set a Content-Type header — the http wrapper derives the multipart boundary.
+   */
+  private async uploadSegment(seq: number, blob: Blob): Promise<void> {
+    const form = new FormData();
+    form.append("seq", String(seq));
+    form.append("segment", blob, `segment-${seq}.webm`);
+    const res = await this.http.request(
+      `scribe_sessions/${this.id}/audio/segments`,
+      { method: "POST", body: form },
+    );
+    if (!res.ok) throw await errorFromResponse(res, `segment ${seq} upload`);
+  }
+
+  /**
+   * Poll `GET scribe_sessions/:id` while recording and emit the growing
+   * transcript via the existing partial channel, reusing the same GET + mapper
+   * as {@link result}. Runs only until stopped (runStop/cancel); result() is the
+   * authoritative post-commit poll. Errors are swallowed (best-effort).
+   */
+  private startLivePoll(intervalMs: number): void {
+    if (this.livePolling) return;
+    this.livePolling = true;
+    const tick = async () => {
+      if (!this.livePolling) return;
+      try {
+        const body = await this.http.getJson<WireSessionBody>(
+          `scribe_sessions/${this.id}`,
+          "live transcript poll",
+        );
+        const mapped = mapSessionBody(body);
+        if (mapped.transcript !== undefined) this.emitPartial(mapped.transcript);
+      } catch {
+        // Best-effort: swallow poll errors; result() is the authoritative poll.
+      }
+      if (this.livePolling) this.livePollTimer = setTimeout(tick, intervalMs);
+    };
+    this.livePollTimer = setTimeout(tick, intervalMs);
+  }
+
+  private stopLivePoll(): void {
+    this.livePolling = false;
+    if (this.livePollTimer !== undefined) {
+      clearTimeout(this.livePollTimer);
+      this.livePollTimer = undefined;
+    }
   }
 
   /* ----------------------------------------------------------------------
