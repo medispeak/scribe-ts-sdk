@@ -65,6 +65,12 @@ export const defaultSegmentRecorderFactory: SegmentRecorderFactory = async ({
   const stream = await nav.mediaDevices.getUserMedia({ audio: true });
 
   let stopped = false;
+  // Set the instant a rotation stop() is requested (timer-driven), cleared when
+  // the next recorder starts. It closes the race between the timer firing
+  // recorder.stop() and its async onstop: the next segment recorder is started
+  // ONLY from onstop (never the timer), and no stop() is issued twice on the same
+  // recorder — so two segment recorders can never overlap on the shared stream.
+  let restarting = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let active: MediaRecorder | undefined;
   let resolveStopped!: () => void;
@@ -78,6 +84,8 @@ export const defaultSegmentRecorderFactory: SegmentRecorderFactory = async ({
 
   const startSegment = () => {
     if (stopped) return;
+    // A fresh recorder is now the active one; any prior rotation has completed.
+    restarting = false;
     const recorder = new MediaRecorderCtor(stream);
     active = recorder;
     const parts: Blob[] = [];
@@ -86,7 +94,10 @@ export const defaultSegmentRecorderFactory: SegmentRecorderFactory = async ({
       if (data && (data.size === undefined || data.size > 0)) parts.push(data);
     };
     recorder.onstop = () => {
-      // Assemble this segment's complete, standalone file and emit it.
+      // The previous recorder has now fully stopped. Assemble + emit its
+      // complete, standalone file, then — and only then — start the next
+      // segment. Driving the restart from onstop (never the timer) guarantees
+      // the next recorder starts after this one is done, never alongside it.
       if (parts.length > 0) {
         const type = parts[0]?.type || "audio/webm";
         onSegment(new Blob(parts, { type }));
@@ -99,9 +110,14 @@ export const defaultSegmentRecorderFactory: SegmentRecorderFactory = async ({
       }
     };
     recorder.start();
-    // Restart per segment: each stop() flushes one complete, decodable file.
+    // Rotate on a fixed cadence: the timer only *requests* a stop (each stop()
+    // flushes one complete, decodable file). Guard with `restarting` so a
+    // concurrent public stop() cannot also call stop() on the same recorder.
     timer = setTimeout(() => {
-      if (recorder.state !== "inactive") recorder.stop();
+      if (!stopped && !restarting && recorder.state !== "inactive") {
+        restarting = true;
+        recorder.stop();
+      }
     }, segmentMs);
   };
 
@@ -114,7 +130,12 @@ export const defaultSegmentRecorderFactory: SegmentRecorderFactory = async ({
         clearTimeout(timer);
         timer = undefined;
       }
-      // Flush the in-flight segment; its onstop emits + releases + resolves.
+      // A rotation stop() is already in flight: its pending onstop will emit,
+      // release the mic, and resolve (with `stopped` set it won't restart). Do
+      // NOT call stop() again — a double stop() would throw in a real browser.
+      if (restarting) return stoppedPromise;
+      // Otherwise flush the in-flight segment; its onstop emits + releases +
+      // resolves. If nothing is active, release + resolve directly.
       if (active && active.state !== "inactive") active.stop();
       else {
         releaseMic();

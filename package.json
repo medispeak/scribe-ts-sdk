@@ -1,6 +1,6 @@
 {
   "name": "@medispeak/scribe-ts-sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Medispeak-native browser scribe SDK: record a consultation and auto-fill a form, without ever holding an account secret in the browser.",
   "type": "module",
   "license": "MIT",

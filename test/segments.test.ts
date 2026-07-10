@@ -65,6 +65,9 @@ describe("segments: upload", () => {
     expect(posts[1]!.bearer).toBe(TOKEN);
     // segmentMs default threaded through to the segment recorder.
     expect(segments.segmentMs()).toBe(6000);
+
+    // Tear down so the live-poll setTimeout does not outlive the test.
+    await session.cancel();
   });
 
   it("(b) swallows a segment upload failure without affecting storage chunks", async () => {
@@ -108,6 +111,9 @@ describe("segments: upload", () => {
     expect(chunkPosts).toEqual([0]);
     // The segment upload was attempted (and swallowed).
     expect(mock.matching("/audio/segments", "POST").length).toBe(1);
+
+    // Tear down so the live-poll setTimeout does not outlive the test.
+    await session.cancel();
   });
 });
 
@@ -160,6 +166,9 @@ describe("segments: live transcript poll", () => {
     expect(statuses).toContain("recording");
     expect(statuses).not.toContain("processing");
     expect(partials[0]).toBe("Hel");
+
+    // Tear down so the live-poll setTimeout does not outlive the test.
+    await session.cancel();
   });
 });
 

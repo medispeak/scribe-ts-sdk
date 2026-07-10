@@ -341,10 +341,10 @@ export class Session implements ScribeSession {
    */
   async retry(): Promise<void> {
     await this.hydrate();
-    // Re-derive the final-seq fallback before reconcile, exactly as runStop
-    // does: hydrate restores finalSeq from persisted meta, but if the final
-    // chunk was acked pre-interruption this guarantees the highest produced seq
-    // is still reported as final.
+    // Final-seq fallback, mirroring runStop: hydrate restores finalSeq from the
+    // persisted meta of the full set (incl. an already-acked final chunk), so
+    // this only fires when NO persisted chunk was flagged final. nextSeq is now
+    // derived from store.getAll, so nextSeq - 1 is the true highest produced seq.
     if (this.finalSeq === undefined && this.nextSeq > 0) {
       this.finalSeq = this.nextSeq - 1;
     }
@@ -367,14 +367,24 @@ export class Session implements ScribeSession {
    * knows which seqs are pending before record()/retry() runs reconcile().
    */
   async hydrate(): Promise<void> {
-    const pending = await this.store.getPending(this.id);
-    for (const { seq, blob, meta } of pending) {
-      this.buffer.set(seq, blob);
+    // Derive nextSeq and the final marker from the FULL persisted set, not just
+    // the pending (un-acked) chunks. If the final (highest-seq) chunk was acked
+    // before an interruption but the commit then failed, getPending() omits it —
+    // so a pending-only derivation would under-count nextSeq and lose the final
+    // seq, letting retry()'s fallback mis-mark an earlier chunk as final. Reading
+    // the whole set keeps completeness correct across a resume: an already-acked
+    // final chunk still restores finalSeq from its `{ final: true }` store meta.
+    const all = await this.store.getAll(this.id);
+    for (const { seq, meta } of all) {
       if (seq + 1 > this.nextSeq) this.nextSeq = seq + 1;
-      if (!this.queue.includes(seq)) this.queue.push(seq);
-      // Restore final-ness from the persisted meta so the resumed re-send still
-      // POSTs the final chunk with final=true.
       if (meta?.final === true) this.finalSeq = seq;
+    }
+    // Only the un-acked tail needs re-buffering + re-queuing for re-send; acked
+    // chunks are already durably on the server.
+    const pending = await this.store.getPending(this.id);
+    for (const { seq, blob } of pending) {
+      this.buffer.set(seq, blob);
+      if (!this.queue.includes(seq)) this.queue.push(seq);
     }
     this.queue.sort((a, b) => a - b);
   }

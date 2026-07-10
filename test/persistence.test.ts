@@ -224,6 +224,77 @@ describe("persistence: durable capture (MemoryChunkStore)", () => {
     expect(await store.getAll("sess")).toEqual([]);
     expect(session.status).toBe("processing");
   });
+
+  it("(h) an acked final chunk survives resume: the final seq is restored from store meta, never mis-marked onto an earlier chunk", async () => {
+    // The shape the fix targets: the trailing chunk (seq 2) is marked final in
+    // the store AND acked (the server already received it), while earlier chunks
+    // (0, 1) are still pending. Because getPending() omits the acked final chunk,
+    // a pending-only hydrate loses the final seq and derives nextSeq too low, so
+    // the finalSeq fallback wrongly stamps final=true onto seq 1 on re-send.
+    const state = { statusSeqs: [] as number[], fail: true };
+    const chunkPosts: RecordedCall[] = [];
+    const mock = createFetchMock((call) => {
+      if (call.url.endsWith("/audio/status")) {
+        return resp(
+          { received_seqs: state.statusSeqs, final_seen: false, bytes: 0 },
+          200,
+        );
+      }
+      if (call.url.endsWith("/audio/chunks")) {
+        if (!state.fail) chunkPosts.push(call);
+        return state.fail
+          ? resp({ error: "net" }, 500)
+          : resp({ received: Number(formField(call.body, "seq")) }, 200);
+      }
+      if (call.url.endsWith("/commit")) {
+        return state.fail ? resp({ error: "down" }, 500) : resp({}, 202);
+      }
+      return resp({ error: "unexpected" }, 500);
+    });
+
+    const recorder = installMockRecorder();
+    recorder.setFinalChunk(audioBlob("final"));
+
+    // First session: live chunk uploads fail so 0, 1 stay pending. At stop the
+    // trailing chunk (seq 2) is persisted with { final: true }; the server
+    // reports it as already received, so reconcile acks seq 2 while 0, 1 remain
+    // pending. Commit then fails → interrupted.
+    const first = fastSession("sess", mock.fn);
+    await first.record();
+    recorder.emit(audioBlob("a")); // seq 0 → upload fails → pending
+    recorder.emit(audioBlob("b")); // seq 1 → upload fails → pending
+    state.statusSeqs = [2]; // server durably holds the final chunk
+    await expect(first.stop()).rejects.toThrow();
+    expect(first.status).toBe("interrupted");
+
+    // Store invariant: 0, 1 pending; 2 acked and flagged final.
+    expect((await store.getPending("sess")).map((c) => c.seq)).toEqual([0, 1]);
+    expect((await store.getAll("sess")).map((c) => c.seq)).toEqual([0, 1, 2]);
+    expect(
+      (await store.getAll("sess")).find((c) => c.seq === 2)!.meta?.final,
+    ).toBe(true);
+
+    // "Reload": a brand-new client + session over the SAME store; network
+    // recovered. The server still holds the final chunk (seq 2).
+    state.fail = false;
+    const client = createScribeClient({
+      baseUrl: BASE,
+      getToken: () => TOKEN,
+      fetch: mock.fn,
+    });
+    const resumed = (await client.resume("sess")) as Session;
+    await resumed.retry();
+
+    // Only the pending chunks are re-sent (the acked final chunk is not).
+    expect(chunkPosts.map((c) => formField(c.body, "seq"))).toEqual(["0", "1"]);
+    // The fix restores finalSeq = 2 from the store meta, so NO re-sent chunk is
+    // stamped final. Pre-fix, hydrate lost the acked final seq and the fallback
+    // set finalSeq = 1, POSTing seq 1 with final=true.
+    for (const post of chunkPosts) {
+      expect(formField(post.body, "final")).toBeNull();
+    }
+    expect(resumed.status).toBe("processing");
+  });
 });
 
 describe("persistence: real IndexedDbChunkStore (fake-indexeddb)", () => {
