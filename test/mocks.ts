@@ -1,5 +1,6 @@
 import { vi } from "vitest";
 import { setRecorderFactory, type RecorderFactory } from "../src/media";
+import { MemoryChunkStore, setChunkStore } from "../src/persistence";
 
 /** A minimal Response-like object exposing just what the SDK reads. */
 export function resp(body: unknown, status = 200): Response {
@@ -131,4 +132,15 @@ export function installMockRecorder(): MockRecorderHandle {
 /** A tiny audio blob for tests. */
 export function audioBlob(label = "audio"): Blob {
   return new Blob([label], { type: "audio/webm" });
+}
+
+/**
+ * Install an in-memory chunk store (mirrors installMockRecorder) and return it
+ * as the handle: MemoryChunkStore already exposes getAll/getPending/
+ * listUnfinished/clear for assertions. Tests call resetChunkStore() in afterEach.
+ */
+export function installMemoryChunkStore(): MemoryChunkStore {
+  const store = new MemoryChunkStore();
+  setChunkStore(store);
+  return store;
 }

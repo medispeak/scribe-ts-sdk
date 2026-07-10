@@ -87,6 +87,7 @@ export type ScribeStatus =
   | "recording"
   | "paused"
   | "processing"
+  | "interrupted" // upload/commit could not reach/complete the server
   | "completed"
   | "failed";
 
@@ -105,6 +106,8 @@ export interface ScribeClientConfig {
   getToken: (sessionId: string) => string | Promise<string>;
   /** Optional `fetch` implementation (defaults to the global `fetch`). */
   fetch?: typeof fetch;
+  /** Keep the local recording in the store after a successful commit (default false). */
+  retainLocalRecording?: boolean;
 }
 
 export interface RecordOptions {
@@ -133,6 +136,13 @@ export interface ScribeSession {
   cancel(): Promise<void>;
   /** Poll until a terminal status and return the mapped result. */
   result(opts?: ResultOptions): Promise<ScribeResult>;
+  /**
+   * The local recording as one continuous Blob (all stored chunks concatenated
+   * in seq order) plus an object URL, or undefined if nothing is stored.
+   */
+  localRecording(): Promise<{ url: string; blob: Blob } | undefined>;
+  /** Re-send any pending chunks and commit. Use after an `interrupted` status. */
+  retry(): Promise<void>;
   /** Subscribe to partial transcript updates. Returns an unsubscribe function. */
   onPartialTranscript(cb: (text: string) => void): () => void;
   /** Subscribe to status changes. Returns an unsubscribe function. */
@@ -142,6 +152,12 @@ export interface ScribeSession {
 export interface ScribeClient {
   /** Bind to an existing session id (created + token-minted by your backend). */
   session(sessionId: string): ScribeSession;
+  /**
+   * Rebuild a session from locally persisted chunks (e.g. after a reload) and
+   * re-hydrate its pending seqs. The caller then invokes `retry()` to reconcile
+   * and commit — a resumed session is `idle`, so `stop()` would throw.
+   */
+  resume(sessionId: string): Promise<ScribeSession>;
 }
 
 /* --------------------------------------------------------------------------

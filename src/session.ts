@@ -11,6 +11,7 @@ import {
   type WireSessionBody,
 } from "./mapping";
 import { getRecorderFactory, type RecorderController } from "./media";
+import { getChunkStore, type ChunkStore } from "./persistence";
 import type {
   RecordOptions,
   ResultOptions,
@@ -22,6 +23,22 @@ import type {
 const DEFAULT_CHUNK_MS = 5000;
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_TIMEOUT_MS = 120000;
+const DEFAULT_UPLOAD_ATTEMPTS = 3;
+const DEFAULT_BACKOFF_BASE_MS = 200;
+
+/**
+ * Internal construction options for {@link Session}.
+ *
+ * `retainLocalRecording` is surfaced publicly via `ScribeClientConfig`.
+ * `uploadAttempts` / `backoffBase` are internal knobs (not part of the public
+ * config surface) that tests use to disable real backoff sleeps and keep the
+ * per-seq POST count deterministic.
+ */
+export interface SessionOptions {
+  retainLocalRecording?: boolean;
+  uploadAttempts?: number;
+  backoffBase?: number;
+}
 
 /** Backend wire body for `GET /scribe_sessions/:id/audio/status`. */
 interface AudioStatusBody {
@@ -59,14 +76,33 @@ export class Session implements ScribeSession {
   private finalSeq: number | undefined;
   private drainPromise: Promise<void> | null = null;
 
+  // Durable source of truth. Every captured chunk is persisted here and kept
+  // until the server acks the commit, so a reload/crash/hard failure never
+  // destroys audio. `pendingPuts` tracks in-flight persistence writes so a
+  // clear() can await them and never race a late put that would resurrect a
+  // ghost session.
+  private readonly store: ChunkStore;
+  private readonly pendingPuts = new Set<Promise<void>>();
+
+  // Bounded-retry knobs for the per-chunk upload. Defaults are production-safe;
+  // tests override `uploadAttempts = 1` to keep POST counts deterministic/fast.
+  private readonly uploadAttempts: number;
+  private readonly backoffBase: number;
+  // Keep the local recording after a successful commit (default false).
+  private readonly retainLocalRecording: boolean;
+
   private stopping = false;
   private canceled = false;
   // Memoizes the in-flight stop() so concurrent calls share one commit.
   private stopPromise: Promise<void> | null = null;
 
-  constructor(id: string, http: SessionHttp) {
+  constructor(id: string, http: SessionHttp, opts: SessionOptions = {}) {
     this.id = id;
     this.http = http;
+    this.store = getChunkStore();
+    this.uploadAttempts = opts.uploadAttempts ?? DEFAULT_UPLOAD_ATTEMPTS;
+    this.backoffBase = opts.backoffBase ?? DEFAULT_BACKOFF_BASE_MS;
+    this.retainLocalRecording = opts.retainLocalRecording ?? false;
   }
 
   /* ----------------------------------------------------------------------
@@ -175,18 +211,27 @@ export class Session implements ScribeSession {
       this.finalSeq = this.nextSeq - 1;
     }
 
-    // Re-send anything the server is still missing (incl. the final chunk).
-    await this.reconcile();
-
-    const res = await this.http.request(`scribe_sessions/${this.id}/commit`, {
-      method: "POST",
-    });
-    if (!res.ok) throw await errorFromResponse(res, "commit");
-
+    // On a terminal upload/commit failure, do NOT throw the recording away:
+    // transition to `interrupted` (distinct from `failed`, which means the
+    // server's processing failed) and leave everything in IndexedDB for retry().
+    try {
+      // Re-send anything the server is still missing (incl. the final chunk).
+      await this.reconcile();
+      const res = await this.http.request(`scribe_sessions/${this.id}/commit`, {
+        method: "POST",
+      });
+      if (!res.ok) throw await errorFromResponse(res, "commit");
+    } catch (err) {
+      this.setStatus("interrupted");
+      throw err;
+    }
+    await this.clearStore(); // Guarded by retainLocalRecording; awaits in-flight puts.
     this.setStatus("processing");
   }
 
   async cancel(): Promise<void> {
+    // Set canceled first so enqueue() early-returns and enqueues no new puts;
+    // the `pendingPuts` set clearStore() awaits below is therefore final.
     this.canceled = true;
     this.stopping = false;
     this.queue = [];
@@ -198,7 +243,94 @@ export class Session implements ScribeSession {
       }
       this.controller = undefined;
     }
+    // The user abandoned the recording: drop the local copy (unless retained).
+    await this.clearStore();
     this.setStatus("idle");
+  }
+
+  /* ----------------------------------------------------------------------
+   * Durable recording: playback, retry, resume
+   * -------------------------------------------------------------------- */
+
+  /**
+   * The local recording as one continuous Blob (all stored chunks concatenated
+   * in seq order) plus an object URL, or undefined if nothing is stored. A
+   * single MediaRecorder session produces one continuous file whose timeslice
+   * chunks concatenate byte-for-byte, so naive concatenation is valid.
+   */
+  async localRecording(): Promise<{ url: string; blob: Blob } | undefined> {
+    const chunks = await this.store.getAll(this.id);
+    if (chunks.length === 0) return undefined;
+    const ordered = chunks
+      .slice()
+      .sort((a, b) => a.seq - b.seq)
+      .map((c) => c.blob);
+    const type = ordered[0]?.type || "audio/webm";
+    const blob = new Blob(ordered, { type });
+    return { url: URL.createObjectURL(blob), blob };
+  }
+
+  /**
+   * Re-send any pending (un-acked) chunks and commit. Safe to call from
+   * `interrupted` (a failed stop()) and after a reload via `client.resume()`.
+   * A resumed session is `idle` and stop() throws for non-recording status, so
+   * retry() — which runs reconcile()+flush()+commit and is safe from `idle` — is
+   * the sole post-resume commit path.
+   */
+  async retry(): Promise<void> {
+    await this.hydrate();
+    // Re-derive the final-seq fallback before reconcile, exactly as runStop
+    // does: hydrate restores finalSeq from persisted meta, but if the final
+    // chunk was acked pre-interruption this guarantees the highest produced seq
+    // is still reported as final.
+    if (this.finalSeq === undefined && this.nextSeq > 0) {
+      this.finalSeq = this.nextSeq - 1;
+    }
+    await this.reconcile();
+    await this.flush();
+    const res = await this.http.request(`scribe_sessions/${this.id}/commit`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      this.setStatus("interrupted");
+      throw await errorFromResponse(res, "commit");
+    }
+    await this.clearStore();
+    this.setStatus("processing");
+  }
+
+  /**
+   * Re-load pending (un-acked) chunks from the store into the in-memory buffer
+   * so a freshly constructed Session (over the same store, e.g. after a reload)
+   * knows which seqs are pending before record()/retry() runs reconcile().
+   */
+  async hydrate(): Promise<void> {
+    const pending = await this.store.getPending(this.id);
+    for (const { seq, blob, meta } of pending) {
+      this.buffer.set(seq, blob);
+      if (seq + 1 > this.nextSeq) this.nextSeq = seq + 1;
+      if (!this.queue.includes(seq)) this.queue.push(seq);
+      // Restore final-ness from the persisted meta so the resumed re-send still
+      // POSTs the final chunk with final=true.
+      if (meta?.final === true) this.finalSeq = seq;
+    }
+    this.queue.sort((a, b) => a - b);
+  }
+
+  /**
+   * Remove the persisted recording — the ONLY call site of `store.clear`.
+   * Invoked solely on the post-commit-ack success paths (runStop, retry) and on
+   * cancel(). Awaits every in-flight enqueue put first so none lands after
+   * clear() and resurrects a ghost session `listUnfinished()` would report
+   * forever. Gated by `retainLocalRecording`.
+   *
+   * Invariant: cancel() sets `canceled = true` before calling this, so enqueue()
+   * early-returns and the awaited `pendingPuts` set is final.
+   */
+  private async clearStore(): Promise<void> {
+    if (this.retainLocalRecording) return;
+    await Promise.allSettled([...this.pendingPuts]);
+    await this.store.clear(this.id);
   }
 
   /* ----------------------------------------------------------------------
@@ -208,12 +340,35 @@ export class Session implements ScribeSession {
   private enqueue(blob: Blob): void {
     if (this.canceled) return;
     const seq = this.nextSeq++;
+    const isFinal = this.stopping;
+    if (isFinal) this.finalSeq = seq;
+    // Source of truth: persist before anything else. Swallow store errors so a
+    // storage hiccup never drops capture; the in-memory buffer still lets the
+    // live upload proceed. Persist final-ness in the store meta so it survives a
+    // reload/retry: the resumed session must know which seq is the final one.
+    this.trackPut(
+      this.store.put(this.id, seq, blob, isFinal ? { final: true } : undefined),
+    );
     this.buffer.set(seq, blob);
-    if (this.stopping) this.finalSeq = seq;
     this.queue.push(seq);
     // Live uploads: swallow transient errors here; they are retried by the
     // reconcile()+flush() at stop(), which surfaces failures to the caller.
     void this.drain().catch(() => undefined);
+  }
+
+  /**
+   * Track an in-flight persistence `put` so {@link clearStore} can await it
+   * before clearing — a put that resolves after clear() would re-insert a record
+   * and leave a ghost session `listUnfinished()` reports forever. Store errors
+   * are swallowed here so a storage hiccup never drops capture.
+   */
+  private trackPut(p: Promise<void>): void {
+    const done = p
+      .catch(() => undefined)
+      .finally(() => {
+        this.pendingPuts.delete(done);
+      });
+    this.pendingPuts.add(done);
   }
 
   /** Consult audio/status, mark received seqs, and re-enqueue what's missing. */
@@ -289,23 +444,44 @@ export class Session implements ScribeSession {
   private markUploaded(seq: number): void {
     this.uploaded.add(seq);
     this.buffer.delete(seq);
+    // Persisted copy is retained until commit; only mark it acked. Never
+    // removed from the store here — only clearStore() (post-commit) deletes it.
+    void this.store.markAcked(this.id, seq).catch(() => undefined);
   }
 
+  /**
+   * Upload one chunk with a bounded exponential backoff so a transient network
+   * blip does not surface as a terminal failure. Attempts and base delay are
+   * injectable (defaults 3 / 200ms); the final terminal failure is rethrown to
+   * the drain, which surfaces it to the caller (stop()/retry()).
+   */
   private async uploadChunk(
     seq: number,
     blob: Blob,
     final: boolean,
   ): Promise<void> {
-    const form = new FormData();
-    form.append("seq", String(seq));
-    form.append("chunk", blob, `chunk-${seq}.webm`);
-    if (final) form.append("final", "true");
-
-    const res = await this.http.request(
-      `scribe_sessions/${this.id}/audio/chunks`,
-      { method: "POST", body: form },
-    );
-    if (!res.ok) throw await errorFromResponse(res, `chunk ${seq} upload`);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < this.uploadAttempts; attempt++) {
+      try {
+        const form = new FormData();
+        form.append("seq", String(seq));
+        form.append("chunk", blob, `chunk-${seq}.webm`);
+        if (final) form.append("final", "true");
+        const res = await this.http.request(
+          `scribe_sessions/${this.id}/audio/chunks`,
+          { method: "POST", body: form },
+        );
+        if (res.ok) return;
+        lastErr = await errorFromResponse(res, `chunk ${seq} upload`);
+      } catch (err) {
+        lastErr = err;
+      }
+      // Backoff before the next attempt (skip the wait after the last attempt).
+      if (attempt < this.uploadAttempts - 1) {
+        await sleep(this.backoffBase * 2 ** attempt);
+      }
+    }
+    throw lastErr;
   }
 
   /* ----------------------------------------------------------------------
