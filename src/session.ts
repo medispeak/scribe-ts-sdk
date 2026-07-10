@@ -25,9 +25,12 @@ import type {
 } from "./types";
 
 const DEFAULT_CHUNK_MS = 5000;
-const DEFAULT_SEGMENT_MS = 6000;
-const DEFAULT_POLL_INTERVAL_MS = 2000;
-const DEFAULT_LIVE_POLL_INTERVAL_MS = 1500;
+// Short segments make the live transcript feel real-time: ASR latency is
+// overhead-bound (~2s per call regardless of clip length), so a 2.5s segment
+// costs almost the same as a 6s one but surfaces the first words ~3.5s sooner.
+const DEFAULT_SEGMENT_MS = 2500;
+const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_LIVE_POLL_INTERVAL_MS = 700;
 const DEFAULT_TIMEOUT_MS = 120000;
 const DEFAULT_UPLOAD_ATTEMPTS = 3;
 const DEFAULT_BACKOFF_BASE_MS = 200;

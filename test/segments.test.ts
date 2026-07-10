@@ -64,7 +64,7 @@ describe("segments: upload", () => {
     expect(posts[0]!.bearer).toBe(TOKEN);
     expect(posts[1]!.bearer).toBe(TOKEN);
     // segmentMs default threaded through to the segment recorder.
-    expect(segments.segmentMs()).toBe(6000);
+    expect(segments.segmentMs()).toBe(2500);
 
     // Tear down so the live-poll setTimeout does not outlive the test.
     await session.cancel();
