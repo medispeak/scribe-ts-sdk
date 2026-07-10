@@ -61,6 +61,13 @@ export function mapOutputSpec(output: OutputSpec): WireOutput {
 export interface WireSessionBody {
   id: string;
   status: string;
+  /**
+   * Top-level transcript the backend surfaces the instant ASR lands — and, while
+   * recording, the GROWING live transcript assembled from the segments received
+   * so far. This is the real-time source: the per-output `transcript` result is
+   * only populated at commit, so a live poll must read this field, not outputs.
+   */
+  transcript?: { text?: string; language?: string } | null;
   outputs?: Array<{
     id: string;
     type: string;
@@ -133,7 +140,14 @@ export function mapSessionBody(body: WireSessionBody): ScribeResult {
     errors: o.errors,
   }));
 
-  const transcript = extractTranscript(outputs);
+  // Prefer the top-level `transcript` — it carries the growing LIVE transcript
+  // during recording (the per-output transcript is only filled at commit). Fall
+  // back to the output for older backends without the top-level field.
+  const topLevel = body.transcript?.text;
+  const transcript =
+    typeof topLevel === "string" && topLevel.length > 0
+      ? topLevel
+      : extractTranscript(outputs);
   const structuredData = mergeStructuredData(outputs);
 
   const status: ScribeResult["status"] =
