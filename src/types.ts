@@ -128,6 +128,16 @@ export interface RecordOptions {
    * transcript only).
    */
   liveTranscription?: boolean;
+  /**
+   * Stream the mic DIRECTLY to the realtime provider (OpenAI) for
+   * low-latency live transcription, via a backend-minted ephemeral token.
+   * Replaces the segment-poll live path when set. The durable storage recorder
+   * still runs and remains the authoritative source for the committed
+   * transcript, so realtime is a pure live-UX overlay. Best-effort: if the
+   * realtime connection fails, capture + commit are unaffected. Requires the
+   * backend SCRIBE_REALTIME flag. Defaults to `false`.
+   */
+  realtime?: boolean;
 }
 
 export interface ResultOptions {

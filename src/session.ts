@@ -12,6 +12,7 @@ import {
 } from "./mapping";
 import { getRecorderFactory, type RecorderController } from "./media";
 import { getChunkStore, type ChunkStore } from "./persistence";
+import { RealtimeTranscriber } from "./realtime";
 import {
   getSegmentRecorderFactory,
   type SegmentController,
@@ -84,6 +85,12 @@ export class Session implements ScribeSession {
   private nextSegmentSeq = 0;
   private livePollTimer: ReturnType<typeof setTimeout> | undefined;
   private livePolling = false;
+
+  // Realtime transcription (opt-in, additive, isolated). When RecordOptions.realtime
+  // is set, the mic streams directly to the provider (via a backend ephemeral
+  // token) and partials arrive over WebRTC — replacing the segment+poll live path.
+  // The durable storage recorder still runs and stays authoritative.
+  private realtime: RealtimeTranscriber | undefined;
 
   // Upload bookkeeping. Chunks are buffered so a resume can re-send only the
   // seqs the server has not acknowledged. Once a chunk is durably uploaded
@@ -182,6 +189,24 @@ export class Session implements ScribeSession {
       onChunk: (blob) => this.enqueue(blob),
     });
 
+    // Realtime transcription (opt-in) streams the mic directly to the provider
+    // for the lowest-latency live transcript, replacing the segment+poll path.
+    // Additive + isolated: it starts AFTER the durable recorder and can never
+    // block it; a failure is swallowed (onError) and capture/commit continue.
+    if (opts?.realtime) {
+      this.realtime = new RealtimeTranscriber(this.http, this.id, {
+        onPartial: (text) => this.emitPartial(text),
+        onError: () => {
+          // Best-effort: realtime is a live overlay only; the commit pipeline
+          // still yields the authoritative transcript.
+          this.realtime = undefined;
+        },
+      });
+      // Fire-and-forget: start() resolves even on failure (never throws).
+      void this.realtime.start();
+      return;
+    }
+
     // Live transcription is opt-in and strictly additive: it starts AFTER the
     // durable storage recorder is running and can never block it. Off by default
     // until backend plan 022 is live.
@@ -251,6 +276,10 @@ export class Session implements ScribeSession {
     // from the durable commit below: stopping the poll or a thrown segment
     // stop() must never prevent reconcile/commit.
     this.stopLivePoll();
+    if (this.realtime) {
+      await this.realtime.stop(); // never throws
+      this.realtime = undefined;
+    }
     if (this.segmentController) {
       try {
         await this.segmentController.stop();
@@ -292,6 +321,10 @@ export class Session implements ScribeSession {
     this.queue = [];
     // Best-effort teardown of the live-transcription stream (additive, isolated).
     this.stopLivePoll();
+    if (this.realtime) {
+      await this.realtime.stop(); // never throws
+      this.realtime = undefined;
+    }
     if (this.segmentController) {
       try {
         await this.segmentController.stop();
